@@ -20,14 +20,8 @@ jobs:
       - name: Checkout kernel source
         uses: actions/checkout@v4.2.2
         with:
-          ref: oneplus/SM8250_R_11.0
+          ref: refs/heads/oneplus/SM8250_R_11.0
           fetch-depth: 1
-
-      - name: Debug - List root directory
-        run: |
-          echo "Branch: $(git branch --show-current)"
-          echo "Contents:"
-          ls -la $GITHUB_WORKSPACE
 
       - name: Install build dependencies
         run: |
@@ -37,6 +31,12 @@ jobs:
             clang-14 lld-14 llvm-14 \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf \
             libelf-dev libssl-dev lz4 python3 rsync zip zlib1g-dev
+
+      - name: Debug - List root directory
+        run: |
+          echo "Branch: $(git branch --show-current)"
+          echo "Contents:"
+          ls -la $GITHUB_WORKSPACE
 
       - name: Integrate SukiSU Ultra
         run: |
