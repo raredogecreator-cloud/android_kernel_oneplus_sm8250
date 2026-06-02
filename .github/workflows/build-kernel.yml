@@ -23,6 +23,12 @@ jobs:
           ref: oneplus/SM8250_R_11.0
           fetch-depth: 1
 
+      - name: Debug - List root directory
+        run: |
+          echo "Branch: $(git branch --show-current)"
+          echo "Contents:"
+          ls -la $GITHUB_WORKSPACE
+
       - name: Install build dependencies
         run: |
           sudo apt-get update -y
