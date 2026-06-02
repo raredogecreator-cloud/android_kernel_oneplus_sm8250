@@ -20,6 +20,7 @@ jobs:
       - name: Checkout kernel source
         uses: actions/checkout@v4.2.2
         with:
+          ref: oneplus/SM8250_R_11.0
           fetch-depth: 1
 
       - name: Install build dependencies
