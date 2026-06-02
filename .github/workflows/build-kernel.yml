@@ -17,10 +17,9 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout kernel source
+      - name: Checkout workflow files
         uses: actions/checkout@v4.2.2
         with:
-          ref: refs/heads/oneplus/SM8250_R_11.0
           fetch-depth: 1
 
       - name: Install build dependencies
@@ -32,52 +31,59 @@ jobs:
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf \
             libelf-dev libssl-dev lz4 python3 rsync zip zlib1g-dev
 
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 --branch oneplus/SM8250_R_11.0 \
+            https://github.com/OnePlusOSS/android_kernel_oneplus_sm8250.git \
+            kernel-source
+          echo "drivers/ exists: $(ls -d kernel-source/drivers/ 2>/dev/null || echo NO)"
+
       - name: Debug - List root directory
         run: |
-          echo "Branch: $(git branch --show-current)"
+          echo "Branch: $(git -C kernel-source branch --show-current)"
           echo "Contents:"
-          ls -la $GITHUB_WORKSPACE
+          ls -la kernel-source/
 
       - name: Integrate SukiSU Ultra
         run: |
-          cd $GITHUB_WORKSPACE
+          cd $GITHUB_WORKSPACE/kernel-source
           echo "Current directory: $(pwd)"
           echo "drivers/ exists: $(ls -d drivers/ 2>/dev/null || echo NO)"
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
 
       - name: Clone and apply SUSFS patches
         run: |
-          git clone --depth=1 https://github.com/simonpunk/susfs4ksu.git ../susfs4ksu
+          git clone --depth=1 https://github.com/simonpunk/susfs4ksu.git susfs4ksu
 
           # Copy SUSFS source files into the kernel tree
-          cp ../susfs4ksu/fs/susfs.c fs/
-          cp ../susfs4ksu/include/linux/susfs.h include/linux/
-          [ -f ../susfs4ksu/fs/sus_path.c ] && cp ../susfs4ksu/fs/sus_path.c fs/ || true
-          [ -f ../susfs4ksu/include/linux/sus_path.h ] && cp ../susfs4ksu/include/linux/sus_path.h include/linux/ || true
+          cp susfs4ksu/fs/susfs.c kernel-source/fs/
+          cp susfs4ksu/include/linux/susfs.h kernel-source/include/linux/
+          [ -f susfs4ksu/fs/sus_path.c ] && cp susfs4ksu/fs/sus_path.c kernel-source/fs/ || true
+          [ -f susfs4ksu/include/linux/sus_path.h ] && cp susfs4ksu/include/linux/sus_path.h kernel-source/include/linux/ || true
 
           echo "Patches available in susfs4ksu:"
-          find ../susfs4ksu/kernel_patches -name "*.patch" | sort
+          find susfs4ksu/kernel_patches -name "*.patch" | sort
 
           # Apply KSU hook patch (kprobe-based) if present
-          KSU_PATCH=$(find ../susfs4ksu/kernel_patches -maxdepth 1 -name "*.patch" | grep -iE "ksu|hook" | sort | head -1)
+          KSU_PATCH=$(find susfs4ksu/kernel_patches -maxdepth 1 -name "*.patch" | grep -iE "ksu|hook" | sort | head -1)
           if [ -n "$KSU_PATCH" ]; then
             echo "Applying KSU hook patch: $KSU_PATCH"
-            patch -p1 --forward --no-backup-if-mismatch < "$KSU_PATCH" \
+            patch -p1 --forward --no-backup-if-mismatch -d kernel-source < "$KSU_PATCH" \
               || echo "WARNING: KSU patch failed or was already applied"
           fi
 
           # Apply SUSFS kernel integration patch - try 4.19-specific variants first
           APPLIED=0
           for PATCH in \
-            ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-4.19.patch \
-            ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android11-4.19.patch \
-            ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android10-4.19.patch \
-            $(find ../susfs4ksu/kernel_patches -name "*4.19*.patch" | sort | head -1) \
-            $(find ../susfs4ksu/kernel_patches -name "*non*gki*.patch" | sort | head -1); do
+            susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-4.19.patch \
+            susfs4ksu/kernel_patches/50_add_susfs_in_gki-android11-4.19.patch \
+            susfs4ksu/kernel_patches/50_add_susfs_in_gki-android10-4.19.patch \
+            $(find susfs4ksu/kernel_patches -name "*4.19*.patch" | sort | head -1) \
+            $(find susfs4ksu/kernel_patches -name "*non*gki*.patch" | sort | head -1); do
             [ -z "$PATCH" ] || [ ! -f "$PATCH" ] && continue
             echo "Trying SUSFS patch: $PATCH"
-            if patch -p1 --forward --no-backup-if-mismatch --dry-run < "$PATCH" &>/dev/null; then
-              patch -p1 --forward --no-backup-if-mismatch < "$PATCH"
+            if patch -p1 --forward --no-backup-if-mismatch --dry-run -d kernel-source < "$PATCH" &>/dev/null; then
+              patch -p1 --forward --no-backup-if-mismatch -d kernel-source < "$PATCH"
               echo "Successfully applied: $PATCH"
               APPLIED=1
               break
@@ -92,7 +98,7 @@ jobs:
 
       - name: Enable required kernel configurations
         run: |
-          DEFCONFIG="arch/arm64/configs/${KERNEL_DEFCONFIG}"
+          DEFCONFIG="kernel-source/arch/arm64/configs/${KERNEL_DEFCONFIG}"
 
           set_config() {
             local cfg="$1" val="$2"
@@ -117,6 +123,7 @@ jobs:
           grep -E "KALLSYMS|KPROBES|SUSFS" "$DEFCONFIG" || true
 
       - name: Generate kernel .config
+        working-directory: ${{ github.workspace }}/kernel-source
         run: |
           make \
             CC=clang-14 \
@@ -134,6 +141,7 @@ jobs:
             ${KERNEL_DEFCONFIG}
 
       - name: Build kernel
+        working-directory: ${{ github.workspace }}/kernel-source
         run: |
           export KBUILD_BUILD_USER="CI"
           export KBUILD_BUILD_HOST="GitHub-Actions"
@@ -161,7 +169,7 @@ jobs:
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
 
           # Write device-specific anykernel.sh for OnePlus 8 Pro (instantnoodlep)
-          # Using printf instead of a heredoc to avoid YAML block-scalar indentation conflicts.
+          # Using printf to avoid YAML block-scalar indentation conflicts with heredocs.
           {
             printf '%s\n' '# AnyKernel3 AnyKernel Script'
             printf '%s\n' '# osm0sis @ xda-developers'
@@ -190,7 +198,7 @@ jobs:
             printf '%s\n' 'write_boot'
           } > AnyKernel3/anykernel.sh
 
-          BOOT_DIR="out/arch/arm64/boot"
+          BOOT_DIR="kernel-source/out/arch/arm64/boot"
 
           # Copy kernel image - prefer combined Image.gz-dtb, then split files
           if [ -f "${BOOT_DIR}/Image.gz-dtb" ]; then
@@ -232,5 +240,5 @@ jobs:
         uses: actions/upload-artifact@v4.6.0
         with:
           name: build-log
-          path: out/build.log
+          path: kernel-source/out/build.log
           if-no-files-found: ignore
