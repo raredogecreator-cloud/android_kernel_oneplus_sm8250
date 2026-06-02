@@ -1,7 +1,12 @@
-name: Build Kernel - OnePlus 8 Pro (SukiSU Ultra + SUSFS)
+name: Build Kernel - OnePlus 8 Pro (SukiSU Ultra + built-in SUSFS)
 
 on:
   workflow_dispatch:
+    inputs:
+      boot_img_url:
+        description: "Optional URL to stock boot.img (overrides committed stock_boot_IN2021_15_200930.img)"
+        required: false
+        default: ""
   push:
     branches:
       - oneplus/SM8250_R_11.0
@@ -11,6 +16,7 @@ env:
   SUBARCH: arm64
   # SM8250 = Snapdragon 865 = "kona" (not "lahaina" which is SM8350)
   KERNEL_DEFCONFIG: vendor/kona-perf_defconfig
+  STOCK_BOOT_NAME: stock_boot_IN2021_15_200930.img
 
 jobs:
   build:
@@ -22,25 +28,29 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Install build dependencies
+      - name: Install build dependencies and Proton Clang
         run: |
           sudo apt-get update -y
           sudo apt-get install -y \
-            bc bison build-essential ccache curl flex git \
-            clang-14 lld-14 llvm-14 \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf \
-            libelf-dev libssl-dev lz4 python3 rsync zip zlib1g-dev
+            bc bison build-essential ccache curl file flex git \
+            libelf-dev libssl-dev lz4 python3 rsync unzip zip zlib1g-dev
 
-          # LLVM=1 expects unversioned tool names; the apt packages only
-          # provide -14 suffixed binaries. Symlink them so clang, ld.lld,
-          # llvm-ar, etc. resolve to the installed LLVM 14 toolchain.
-          for tool in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy \
-                      llvm-objdump llvm-strip llvm-readelf llvm-ranlib; do
-            if [ -x "/usr/bin/${tool}-14" ]; then
-              sudo ln -sf "/usr/bin/${tool}-14" "/usr/bin/${tool}"
-            fi
-          done
-          clang --version
+          # Proton Clang 20210522 (clang 13) links against libtinfo.so.5,
+          # which is not in the 22.04 default repos. Try the package, else
+          # symlink libtinfo.so.6 to satisfy the loader.
+          sudo apt-get install -y libtinfo5 2>/dev/null \
+            || sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 \
+                           /usr/lib/x86_64-linux-gnu/libtinfo.so.5 \
+            || true
+
+          # Proton Clang prebuilt — exact version the reference uses.
+          # Bundles clang + its own aarch64/arm32 GNU binutils + integrated
+          # assembler, so CROSS_COMPILE resolves inside it (no host /usr/bin/as,
+          # no LLVM=1, no unversioned symlink dance).
+          git clone --depth=1 -b 20210522 \
+            https://github.com/kdrag0n/proton-clang.git "$HOME/proton-clang"
+          echo "$HOME/proton-clang/bin" >> "$GITHUB_PATH"
+          "$HOME/proton-clang/bin/clang" --version || true
 
       - name: Clone kernel source
         run: |
@@ -52,129 +62,38 @@ jobs:
       - name: Debug - List root directory
         run: |
           echo "Branch: $(git -C kernel-source branch --show-current)"
-          echo "Contents:"
           ls -la kernel-source/
 
-      - name: Integrate SukiSU Ultra
+      - name: Integrate SukiSU Ultra (pinned ref, SUSFS built-in)
         run: |
-          cd $GITHUB_WORKSPACE/kernel-source
-          echo "Current directory: $(pwd)"
-          echo "drivers/ exists: $(ls -d drivers/ 2>/dev/null || echo NO)"
-          # susfs-main is the correct branch for non-GKI SUSFS support per
-          # SukiSU docs; it ships SukiSU's own KSU-side SUSFS integration, so
-          # the separate 10_enable_susfs_for_ksu.patch is not needed.
-          # (susfs-dev does not exist and silently fell back to the default.)
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-main
+          cd "$GITHUB_WORKSPACE/kernel-source"
+          # Pinned setup.sh commit + pinned SukiSU ref argument => no silent
+          # branch fallback possible. This ref carries working SUSFS for
+          # SM8250 4.19 (device-agnostic).
+          curl -LSs "https://github.com/liyafe1997/SukiSU-Ultra/raw/4ff14cf0051d04209c4abd5027d99d8e7780ef5b/kernel/setup.sh" | bash -s f4863b20cc8dc0f8cc67418980f022e43014b598
 
-      - name: Debug - KernelSU branches available
+      - name: Verify SukiSU ref actually contains SUSFS
         run: |
-          echo "=== Available SukiSU-Ultra branches ==="
-          git -C kernel-source/KernelSU branch -r
-          git -C kernel-source/KernelSU tag | tail -20
-          echo "=== git branch -a in kernel-source/KernelSU ==="
-          git -C kernel-source/KernelSU branch -a || echo "no KernelSU git dir"
-          echo "=== current KernelSU HEAD ==="
-          git -C kernel-source/KernelSU log --oneline -1 2>/dev/null || true
-          echo "=== KernelSU remotes ==="
-          git -C kernel-source/KernelSU remote -v 2>/dev/null || true
-          echo "=== KernelSU directory listing ==="
-          ls -la kernel-source/KernelSU/ 2>/dev/null || echo "no KernelSU dir"
-          echo "=== setup.sh branch handling ==="
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | grep -nE 'branch|susfs|case|esac|\-b ' || true
-
-      - name: Verify susfs actually integrated
-        run: |
-          if ! grep -rq "susfs" kernel-source/KernelSU/kernel/ 2>/dev/null; then
-            echo "ERROR: SukiSU was set up WITHOUT susfs — wrong branch name. See branch list above."
-            exit 1
-          fi
-          echo "OK: susfs present in KernelSU"
-
-      - name: Clone and apply SUSFS patches
-        run: |
-          # Repo lives on GitLab, branch kernel-4.19
-          git clone --depth=1 -b kernel-4.19 \
-            https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
-
-          # Copy SUSFS source files (paths per upstream README)
-          cp susfs4ksu/kernel_patches/fs/susfs.c kernel-source/fs/
-          cp susfs4ksu/kernel_patches/include/linux/susfs.h kernel-source/include/linux/
-
-          # Apply main kernel patch for 4.19.
-          # --fuzz=3 --ignore-whitespace handles context mismatches in the
-          # vendor-modified OnePlus tree vs stock 4.19.
-          patch -p1 --fuzz=3 --ignore-whitespace -d kernel-source \
-            < susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || true
-
-          # Manual injection for include/linux/sched.h KABI fix
-          sed -i '/randomized_struct_fields_end/i #if defined(CONFIG_KSU_SUSFS)\n\tu64 susfs_task_state;\n\tu64 susfs_last_fake_mnt_id;\n#endif' kernel-source/include/linux/sched.h
-          rm -f kernel-source/include/linux/sched.h.rej
-
-          # Manual injection for include/linux/mount.h KABI fix
-          sed -i '/void \*data;/i #if defined(CONFIG_KSU_SUSFS)\n\tu64 susfs_mnt_id_backup;\n#endif' kernel-source/include/linux/mount.h
-          rm -f kernel-source/include/linux/mount.h.rej
-
-          # Diagnostic: print any SELinux rejection details
-          echo "=== DUMPING SELINUX REJECTIONS ==="
-          cd kernel-source && cat kernel/selinux/*.rej || true && cd ..
-
-          # Strict check: fail if any .rej files remain
-          if find kernel-source -name "*.rej" | grep -q .; then
-            echo "ERROR: Unresolved patch rejections remain!"
-            find kernel-source -name "*.rej"
-            exit 1
-          fi
-
-          # NOTE: 10_enable_susfs_for_ksu.patch is intentionally NOT applied.
-          # SukiSU Ultra's susfs-dev branch already includes the KSU-side
-          # SUSFS code (kernel/ksu.c, allowlist.c, core_hook.c, etc.), so
-          # applying that patch would fail with "can't find file to patch".
-
-      - name: Enable required kernel configurations
-        run: |
-          DEFCONFIG="kernel-source/arch/arm64/configs/${KERNEL_DEFCONFIG}"
-
-          set_config() {
-            local cfg="$1" val="$2"
-            if grep -qE "^# ${cfg} is not set" "$DEFCONFIG"; then
-              sed -i "s/^# ${cfg} is not set/${cfg}=${val}/" "$DEFCONFIG"
-            elif grep -qE "^${cfg}=" "$DEFCONFIG"; then
-              sed -i "s/^${cfg}=.*/${cfg}=${val}/" "$DEFCONFIG"
-            else
-              echo "${cfg}=${val}" >> "$DEFCONFIG"
-            fi
-          }
-
-          # Non-GKI KernelSU/SukiSU requires KALLSYMS for symbol lookup
-          set_config CONFIG_KALLSYMS y
-          set_config CONFIG_KALLSYMS_ALL y
-
-          # kprobe-based hook method
-          set_config CONFIG_KPROBES y
-          set_config CONFIG_KPROBE_EVENTS y
-
-          echo "Relevant config entries after patching:"
-          grep -E "KALLSYMS|KPROBES|SUSFS" "$DEFCONFIG" || true
+          grep -q "KSU_SUSFS" kernel-source/KernelSU/kernel/Kconfig \
+            || { echo "ERROR: this SukiSU ref has no SUSFS"; exit 1; }
+          echo "OK: SUSFS Kconfig present in this SukiSU ref"
 
       - name: Pre-build toolchain fixes
         run: |
-          # 1. GCC/clang default to -fno-common, which trips the DTC lexer's
-          #    tentative "YYLTYPE yylloc;" definition (duplicate of the one in
-          #    the bison-generated parser). Mark it extern. The real source in
-          #    this tree is the flex input dtc-lexer.l (no .lex.c_shipped),
-          #    which flex compiles into dtc-lexer.lex.c at build time.
+          # 1. Host dtc is built with host gcc (-fno-common), which trips the
+          #    DTC lexer's tentative "YYLTYPE yylloc;" (duplicate of the bison
+          #    parser's). Mark it extern. Real source is the flex input
+          #    dtc-lexer.l (no .lex.c_shipped in this tree).
           DTC_LEXER="kernel-source/scripts/dtc/dtc-lexer.l"
           echo "Before:"; grep -n 'YYLTYPE yylloc;' "$DTC_LEXER" || true
           sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/' "$DTC_LEXER"
           echo "After:"; grep -n 'yylloc;' "$DTC_LEXER" || true
 
           # 2. scripts/gcc-wrapper.py is Python 2 end to end (print syntax AND
-          #    bytes/str subprocess handling -> "a bytes-like object is
-          #    required, not 'str'"). We do not need its warning-policing for
-          #    this build, so replace it wholesale with a minimal Python 3
-          #    passthrough that runs the real compiler and propagates its exit
-          #    code. Heredoc body is indented to the YAML block level; YAML
-          #    strips that indentation so the file gets clean column-0 content.
+          #    bytes/str subprocess handling). OnePlus-tree-specific; the
+          #    reference does not need it. Replace wholesale with a minimal
+          #    Python 3 passthrough. Heredoc body is indented to the YAML
+          #    block level; YAML strips it so the file gets column-0 content.
           GCC_WRAPPER="kernel-source/scripts/gcc-wrapper.py"
           cat > "$GCC_WRAPPER" <<'PYEOF'
           #!/usr/bin/env python3
@@ -188,14 +107,52 @@ jobs:
       - name: Generate kernel .config
         working-directory: ${{ github.workspace }}/kernel-source
         run: |
-          make \
-            LLVM=1 \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
+          make ARCH=arm64 SUBARCH=arm64 O=out CC=clang \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-gnueabihf- \
-            ARCH=arm64 \
-            O=out \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
             ${KERNEL_DEFCONFIG}
+
+      - name: Enable KSU + built-in SUSFS + kprobe hooks
+        working-directory: ${{ github.workspace }}/kernel-source
+        run: |
+          # Enable SUSFS via built-in Kconfig flags (reference's set), on
+          # out/.config AFTER defconfig. Kprobe hooks kept; manual hook
+          # explicitly OFF so SukiSU uses the kprobe path (needs KPROBES).
+          # SUS_PATH is explicitly disabled (defaults y, "NOT recommended").
+          scripts/config --file out/.config \
+            -e KSU \
+            -e KSU_SUSFS \
+            -d KSU_MANUAL_HOOK \
+            -e KSU_SUSFS_HAS_MAGIC_MOUNT \
+            -d KSU_SUSFS_SUS_PATH \
+            -e KSU_SUSFS_SUS_MOUNT \
+            -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+            -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
+            -e KSU_SUSFS_SUS_KSTAT \
+            -e KSU_SUSFS_TRY_UMOUNT \
+            -e KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
+            -e KSU_SUSFS_SPOOF_UNAME \
+            -e KSU_SUSFS_ENABLE_LOG \
+            -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+            -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+            -d KSU_SUSFS_OPEN_REDIRECT \
+            -d KSU_SUSFS_SUS_SU \
+            -e KPROBES \
+            -e KPROBE_EVENTS \
+            -e KALLSYMS \
+            -e KALLSYMS_ALL
+
+          # Resolve new symbols / dependencies into a complete .config
+          make ARCH=arm64 O=out CC=clang \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            olddefconfig
+
+          echo "=== Resulting KSU / SUSFS / kprobe config ==="
+          grep -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_KALLSYMS" out/.config || true
 
       - name: Build kernel
         working-directory: ${{ github.workspace }}/kernel-source
@@ -203,24 +160,88 @@ jobs:
           export KBUILD_BUILD_USER="CI"
           export KBUILD_BUILD_HOST="GitHub-Actions"
 
-          make -j$(nproc --all) \
-            LLVM=1 \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
+          make -j"$(nproc --all)" ARCH=arm64 SUBARCH=arm64 O=out CC=clang \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-gnueabihf- \
-            ARCH=arm64 \
-            O=out \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
             2>&1 | tee out/build.log
 
           echo "--- Boot artifacts ---"
           ls -lh out/arch/arm64/boot/ || echo "ERROR: No boot directory found"
 
-      - name: Package with AnyKernel3
+      - name: Build test-boot.img (kernel swap into stock boot)
+        run: |
+          BOOT_DIR="kernel-source/out/arch/arm64/boot"
+
+          # 1. Hard requirement: dtb-appended kernel. Repacking without the
+          #    appended dtb will black-screen on this device.
+          if [ ! -f "${BOOT_DIR}/Image.gz-dtb" ]; then
+            echo "ERROR: build did not produce Image.gz-dtb (dtb-appended kernel)."
+            echo "Found in ${BOOT_DIR}:"
+            ls -lh "${BOOT_DIR}" || true
+            echo "Repacking the stock boot.img with a non-dtb kernel (Image.gz/Image)"
+            echo "would black-screen. Stopping. Enable the appended-dtb image"
+            echo "target (e.g. CONFIG_BUILD_ARM64_APPENDED_DTB_IMAGE) and rebuild."
+            exit 1
+          fi
+          echo "OK: Image.gz-dtb present."
+
+          # 2. Resolve the stock boot.img: dispatch URL takes precedence,
+          #    else the committed file at repo root.
+          STOCK_IMG=""
+          if [ -n "${{ github.event.inputs.boot_img_url }}" ]; then
+            echo "Downloading stock boot.img from provided URL..."
+            curl -LSs -o stock_boot.img "${{ github.event.inputs.boot_img_url }}"
+            STOCK_IMG="stock_boot.img"
+          elif [ -f "${GITHUB_WORKSPACE}/${STOCK_BOOT_NAME}" ]; then
+            echo "Using committed ${STOCK_BOOT_NAME}"
+            STOCK_IMG="${GITHUB_WORKSPACE}/${STOCK_BOOT_NAME}"
+          else
+            echo "ERROR: no stock boot.img found."
+            echo "Provide boot_img_url via workflow_dispatch, or commit"
+            echo "${STOCK_BOOT_NAME} to the repo root."
+            exit 1
+          fi
+          echo "Stock boot image: ${STOCK_IMG}"
+          ls -lh "${STOCK_IMG}"
+
+          # 3. Get magiskboot by extracting it from the Magisk APK (x86_64
+          #    host binary; works for unpack/repack regardless of target arch).
+          MAGISK_VER="v27.0"
+          curl -LSs -o magisk.apk \
+            "https://github.com/topjohnwu/Magisk/releases/download/${MAGISK_VER}/Magisk-${MAGISK_VER}.apk"
+          unzip -o magisk.apk 'lib/x86_64/*' -d magisk_extracted >/dev/null
+          MAGISKBOOT="$(pwd)/magiskboot"
+          cp magisk_extracted/lib/x86_64/libmagiskboot.so "$MAGISKBOOT"
+          chmod +x "$MAGISKBOOT"
+          "$MAGISKBOOT" 2>&1 | head -1 || true
+
+          # 4. Unpack stock, replace ONLY the kernel (raw Image), repack.
+          mkdir -p bootwork
+          cp "${STOCK_IMG}" bootwork/stock_boot.img
+          cp "${BOOT_DIR}/Image" bootwork/new-kernel
+          cd bootwork
+          "$MAGISKBOOT" unpack -h stock_boot.img
+          echo "=== header ==="; cat header || true
+          echo "=== files ==="; ls -lh
+          file kernel
+          if [ ! -f kernel_dtb ]; then
+            echo "ERROR: no kernel_dtb split out — dtb is inside kernel, raw Image swap would lose it. Stop."
+            exit 1
+          fi
+          cp new-kernel kernel
+          "$MAGISKBOOT" repack stock_boot.img ../test-boot.img
+          cd ..
+          ls -lh test-boot.img
+
+      - name: Package with AnyKernel3 (backup, generic config)
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
 
-          # Write device-specific anykernel.sh for OnePlus 8 Pro (instantnoodlep)
-          # Using printf to avoid YAML block-scalar indentation conflicts with heredocs.
+          # Generic anykernel.sh for OnePlus 8 Pro (instantnoodlep).
+          # NOTE: primary install path is fastboot boot/flash test-boot.img;
+          # this zip is just a backup, so no custom slot/block config here.
           {
             printf '%s\n' '# AnyKernel3 AnyKernel Script'
             printf '%s\n' '# osm0sis @ xda-developers'
@@ -250,35 +271,34 @@ jobs:
           } > AnyKernel3/anykernel.sh
 
           BOOT_DIR="kernel-source/out/arch/arm64/boot"
-
-          # Copy kernel image - prefer combined Image.gz-dtb, then split files
           if [ -f "${BOOT_DIR}/Image.gz-dtb" ]; then
             cp "${BOOT_DIR}/Image.gz-dtb" AnyKernel3/
-            echo "Using Image.gz-dtb"
           elif [ -f "${BOOT_DIR}/Image.gz" ]; then
             cp "${BOOT_DIR}/Image.gz" AnyKernel3/
-            echo "Using Image.gz"
           elif [ -f "${BOOT_DIR}/Image" ]; then
             cp "${BOOT_DIR}/Image" AnyKernel3/
-            echo "Using Image"
           else
             echo "ERROR: No kernel image found in ${BOOT_DIR}" && exit 1
           fi
-
-          # Copy DTBO image for A/B devices if present
           [ -f "${BOOT_DIR}/dtbo.img" ] && cp "${BOOT_DIR}/dtbo.img" AnyKernel3/ || true
 
           BUILD_DATE=$(date +%Y%m%d-%H%M%S)
           ZIP_NAME="SukiSU-Ultra_SUSFS_OnePlus8Pro_${BUILD_DATE}.zip"
-
           cd AnyKernel3
           zip -r9 "../${ZIP_NAME}" . -x '*.git*' README.md '*placeholder'
           cd ..
-
           echo "ZIP_NAME=${ZIP_NAME}" >> "$GITHUB_ENV"
           ls -lh "${ZIP_NAME}"
 
-      - name: Upload AnyKernel3 flashable zip
+      - name: Upload test-boot.img
+        uses: actions/upload-artifact@v4.6.0
+        with:
+          name: test-boot-OnePlus8Pro
+          path: test-boot.img
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload AnyKernel3 flashable zip (backup)
         uses: actions/upload-artifact@v4.6.0
         with:
           name: SukiSU-Ultra-SUSFS-OnePlus8Pro
