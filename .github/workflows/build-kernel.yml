@@ -66,6 +66,19 @@ jobs:
           # (susfs-dev does not exist and silently fell back to the default.)
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-main
 
+      - name: Debug - KernelSU branches available
+        run: |
+          echo "=== git branch -a in kernel-source/KernelSU ==="
+          git -C kernel-source/KernelSU branch -a || echo "no KernelSU git dir"
+          echo "=== current KernelSU HEAD ==="
+          git -C kernel-source/KernelSU log --oneline -1 2>/dev/null || true
+          echo "=== KernelSU remotes ==="
+          git -C kernel-source/KernelSU remote -v 2>/dev/null || true
+          echo "=== KernelSU directory listing ==="
+          ls -la kernel-source/KernelSU/ 2>/dev/null || echo "no KernelSU dir"
+          echo "=== setup.sh branch handling ==="
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | grep -nE 'branch|susfs|case|esac|\-b ' || true
+
       - name: Clone and apply SUSFS patches
         run: |
           # Repo lives on GitLab, branch kernel-4.19
@@ -144,20 +157,22 @@ jobs:
           sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/' "$DTC_LEXER"
           echo "After:"; grep -n 'yylloc;' "$DTC_LEXER" || true
 
-          # 2. scripts/gcc-wrapper.py is Python 2 (shebang + print statements);
-          #    the runner only has Python 3, which fails to parse it during the
-          #    Kconfig/defconfig step. Convert the shebang and all print
-          #    statements to Python 3 syntax.
+          # 2. scripts/gcc-wrapper.py is Python 2 end to end (print syntax AND
+          #    bytes/str subprocess handling -> "a bytes-like object is
+          #    required, not 'str'"). We do not need its warning-policing for
+          #    this build, so replace it wholesale with a minimal Python 3
+          #    passthrough that runs the real compiler and propagates its exit
+          #    code. Heredoc body is indented to the YAML block level; YAML
+          #    strips that indentation so the file gets clean column-0 content.
           GCC_WRAPPER="kernel-source/scripts/gcc-wrapper.py"
-          echo "Python 2 print statements before conversion:"
-          grep -nE '^[[:space:]]*print ' "$GCC_WRAPPER" || true
-          # Shebang: python2 -> python3
-          sed -i '1s|env python2|env python3|' "$GCC_WRAPPER"
-          # "print X" -> "print(X)" for any indentation level
-          sed -i 's/^\([[:space:]]*\)print \(.*\)$/\1print(\2)/' "$GCC_WRAPPER"
-          echo "After conversion:"
-          grep -nE '^[[:space:]]*print\(' "$GCC_WRAPPER" || true
-          python3 -c "import ast; ast.parse(open('$GCC_WRAPPER').read()); print('gcc-wrapper.py parses cleanly under Python 3')"
+          cat > "$GCC_WRAPPER" <<'PYEOF'
+          #!/usr/bin/env python3
+          import sys, subprocess
+          sys.exit(subprocess.call(sys.argv[1:]))
+          PYEOF
+          chmod +x "$GCC_WRAPPER"
+          echo "New gcc-wrapper.py:"
+          cat "$GCC_WRAPPER"
 
       - name: Generate kernel .config
         working-directory: ${{ github.workspace }}/kernel-source
