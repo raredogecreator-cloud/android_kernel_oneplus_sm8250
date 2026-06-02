@@ -75,14 +75,13 @@ jobs:
           sed -i '/void \*data;/i #if defined(CONFIG_KSU_SUSFS)\n\tu64 susfs_mnt_id_backup;\n#endif' kernel-source/include/linux/mount.h
           rm -f kernel-source/include/linux/mount.h.rej
 
-          # Fail if any other .rej files remain
-          REMAINING=$(find kernel-source -name "*.rej")
-          if [ -n "$REMAINING" ]; then
-            echo "::error::SUSFS patch had unresolved failed hunks - listing .rej files:"
-            echo "$REMAINING" | while read f; do
-              echo "=== $f ==="
-              cat "$f"
-            done
+          # Diagnostic: print any SELinux rejection details
+          cat kernel-source/kernel/selinux/*.rej || true
+
+          # Strict check: fail if any .rej files remain
+          if find kernel-source -name "*.rej" | grep -q .; then
+            echo "ERROR: Unresolved patch rejections remain!"
+            find kernel-source -name "*.rej"
             exit 1
           fi
 
