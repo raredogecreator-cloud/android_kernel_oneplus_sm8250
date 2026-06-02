@@ -61,12 +61,21 @@ jobs:
           cp susfs4ksu/kernel_patches/fs/susfs.c kernel-source/fs/
           cp susfs4ksu/kernel_patches/include/linux/susfs.h kernel-source/include/linux/
 
-          # Apply main kernel patch for 4.19
-          patch -p1 -d kernel-source \
-            < susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch
+          # Apply main kernel patch for 4.19.
+          # --fuzz=3 --ignore-whitespace handles context mismatches in the
+          # vendor-modified OnePlus tree vs stock 4.19.
+          patch -p1 --fuzz=3 --ignore-whitespace -d kernel-source \
+            < susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || {
+            echo "::error::SUSFS main patch had failed hunks - listing .rej files:"
+            find kernel-source -name "*.rej" | while read f; do
+              echo "=== $f ==="
+              cat "$f"
+            done
+            exit 1
+          }
 
           # Apply KSU enablement patch inside the KernelSU tree
-          patch -p1 -d kernel-source/KernelSU \
+          patch -p1 --fuzz=3 --ignore-whitespace -d kernel-source/KernelSU \
             < susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
 
       - name: Enable required kernel configurations
