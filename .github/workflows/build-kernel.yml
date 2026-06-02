@@ -68,6 +68,9 @@ jobs:
 
       - name: Debug - KernelSU branches available
         run: |
+          echo "=== Available SukiSU-Ultra branches ==="
+          git -C kernel-source/KernelSU branch -r
+          git -C kernel-source/KernelSU tag | tail -20
           echo "=== git branch -a in kernel-source/KernelSU ==="
           git -C kernel-source/KernelSU branch -a || echo "no KernelSU git dir"
           echo "=== current KernelSU HEAD ==="
@@ -78,6 +81,14 @@ jobs:
           ls -la kernel-source/KernelSU/ 2>/dev/null || echo "no KernelSU dir"
           echo "=== setup.sh branch handling ==="
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | grep -nE 'branch|susfs|case|esac|\-b ' || true
+
+      - name: Verify susfs actually integrated
+        run: |
+          if ! grep -rq "susfs" kernel-source/KernelSU/kernel/ 2>/dev/null; then
+            echo "ERROR: SukiSU was set up WITHOUT susfs — wrong branch name. See branch list above."
+            exit 1
+          fi
+          echo "OK: susfs present in KernelSU"
 
       - name: Clone and apply SUSFS patches
         run: |
