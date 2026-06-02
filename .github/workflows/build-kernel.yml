@@ -53,48 +53,21 @@ jobs:
 
       - name: Clone and apply SUSFS patches
         run: |
-          git clone --depth=1 https://x-access-token:${{ github.token }}@github.com/simonpunk/susfs4ksu.git susfs4ksu
+          # Repo lives on GitLab, branch kernel-4.19
+          git clone --depth=1 -b kernel-4.19 \
+            https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
 
-          # Copy SUSFS source files into the kernel tree
-          cp susfs4ksu/fs/susfs.c kernel-source/fs/
-          cp susfs4ksu/include/linux/susfs.h kernel-source/include/linux/
-          [ -f susfs4ksu/fs/sus_path.c ] && cp susfs4ksu/fs/sus_path.c kernel-source/fs/ || true
-          [ -f susfs4ksu/include/linux/sus_path.h ] && cp susfs4ksu/include/linux/sus_path.h kernel-source/include/linux/ || true
+          # Copy SUSFS source files (paths per upstream README)
+          cp susfs4ksu/kernel_patches/fs/susfs.c kernel-source/fs/
+          cp susfs4ksu/kernel_patches/include/linux/susfs.h kernel-source/include/linux/
 
-          echo "Patches available in susfs4ksu:"
-          find susfs4ksu/kernel_patches -name "*.patch" | sort
+          # Apply main kernel patch for 4.19
+          patch -p1 -d kernel-source \
+            < susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch
 
-          # Apply KSU hook patch (kprobe-based) if present
-          KSU_PATCH=$(find susfs4ksu/kernel_patches -maxdepth 1 -name "*.patch" | grep -iE "ksu|hook" | sort | head -1)
-          if [ -n "$KSU_PATCH" ]; then
-            echo "Applying KSU hook patch: $KSU_PATCH"
-            patch -p1 --forward --no-backup-if-mismatch -d kernel-source < "$KSU_PATCH" \
-              || echo "WARNING: KSU patch failed or was already applied"
-          fi
-
-          # Apply SUSFS kernel integration patch - try 4.19-specific variants first
-          APPLIED=0
-          for PATCH in \
-            susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-4.19.patch \
-            susfs4ksu/kernel_patches/50_add_susfs_in_gki-android11-4.19.patch \
-            susfs4ksu/kernel_patches/50_add_susfs_in_gki-android10-4.19.patch \
-            $(find susfs4ksu/kernel_patches -name "*4.19*.patch" | sort | head -1) \
-            $(find susfs4ksu/kernel_patches -name "*non*gki*.patch" | sort | head -1); do
-            [ -z "$PATCH" ] || [ ! -f "$PATCH" ] && continue
-            echo "Trying SUSFS patch: $PATCH"
-            if patch -p1 --forward --no-backup-if-mismatch --dry-run -d kernel-source < "$PATCH" &>/dev/null; then
-              patch -p1 --forward --no-backup-if-mismatch -d kernel-source < "$PATCH"
-              echo "Successfully applied: $PATCH"
-              APPLIED=1
-              break
-            else
-              echo "Patch $PATCH not applicable, trying next..."
-            fi
-          done
-
-          if [ "$APPLIED" -eq 0 ]; then
-            echo "WARNING: No SUSFS kernel patch was applied. Manual integration may be required."
-          fi
+          # Apply KSU enablement patch inside the KernelSU tree
+          patch -p1 -d kernel-source/KernelSU \
+            < susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
 
       - name: Enable required kernel configurations
         run: |
