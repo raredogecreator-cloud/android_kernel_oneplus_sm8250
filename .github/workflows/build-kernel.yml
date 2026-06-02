@@ -31,6 +31,17 @@ jobs:
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf \
             libelf-dev libssl-dev lz4 python3 rsync zip zlib1g-dev
 
+          # LLVM=1 expects unversioned tool names; the apt packages only
+          # provide -14 suffixed binaries. Symlink them so clang, ld.lld,
+          # llvm-ar, etc. resolve to the installed LLVM 14 toolchain.
+          for tool in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy \
+                      llvm-objdump llvm-strip llvm-readelf llvm-ranlib; do
+            if [ -x "/usr/bin/${tool}-14" ]; then
+              sudo ln -sf "/usr/bin/${tool}-14" "/usr/bin/${tool}"
+            fi
+          done
+          clang --version
+
       - name: Clone kernel source
         run: |
           git clone --depth=1 --branch oneplus/SM8250_R_11.0 \
@@ -49,7 +60,9 @@ jobs:
           cd $GITHUB_WORKSPACE/kernel-source
           echo "Current directory: $(pwd)"
           echo "drivers/ exists: $(ls -d drivers/ 2>/dev/null || echo NO)"
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
+          # susfs-dev branch ships SukiSU's own KSU-side SUSFS integration,
+          # so the separate 10_enable_susfs_for_ksu.patch is not needed.
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-dev
 
       - name: Clone and apply SUSFS patches
         run: |
@@ -86,10 +99,10 @@ jobs:
             exit 1
           fi
 
-          # Apply KSU enablement patch from inside the KernelSU directory
-          cd kernel-source/KernelSU
-          patch -p1 --fuzz=3 < ../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch || true
-          cd ../..
+          # NOTE: 10_enable_susfs_for_ksu.patch is intentionally NOT applied.
+          # SukiSU Ultra's susfs-dev branch already includes the KSU-side
+          # SUSFS code (kernel/ksu.c, allowlist.c, core_hook.c, etc.), so
+          # applying that patch would fail with "can't find file to patch".
 
       - name: Enable required kernel configurations
         run: |
@@ -117,17 +130,19 @@ jobs:
           echo "Relevant config entries after patching:"
           grep -E "KALLSYMS|KPROBES|SUSFS" "$DEFCONFIG" || true
 
+      - name: Pre-build toolchain fixes
+        run: |
+          # GCC 10+ defaults to -fno-common, which trips the bundled DTC
+          # lexer's tentative "YYLTYPE yylloc;" definition (multiple
+          # definition error). Mark it extern.
+          sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/' \
+            kernel-source/scripts/dtc/dtc-lexer.lex.c_shipped || true
+
       - name: Generate kernel .config
         working-directory: ${{ github.workspace }}/kernel-source
         run: |
           make \
-            CC=clang-14 \
-            LD=ld.lld-14 \
-            AR=llvm-ar-14 \
-            NM=llvm-nm-14 \
-            OBJCOPY=llvm-objcopy-14 \
-            OBJDUMP=llvm-objdump-14 \
-            STRIP=llvm-strip-14 \
+            LLVM=1 \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabihf- \
@@ -142,13 +157,7 @@ jobs:
           export KBUILD_BUILD_HOST="GitHub-Actions"
 
           make -j$(nproc --all) \
-            CC=clang-14 \
-            LD=ld.lld-14 \
-            AR=llvm-ar-14 \
-            NM=llvm-nm-14 \
-            OBJCOPY=llvm-objcopy-14 \
-            OBJDUMP=llvm-objdump-14 \
-            STRIP=llvm-strip-14 \
+            LLVM=1 \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabihf- \
