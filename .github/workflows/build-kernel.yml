@@ -32,8 +32,10 @@ jobs:
             libelf-dev libssl-dev lz4 python3 rsync zip zlib1g-dev
 
       - name: Integrate SukiSU Ultra
-        working-directory: ${{ github.workspace }}
         run: |
+          cd $GITHUB_WORKSPACE
+          echo "Current directory: $(pwd)"
+          echo "drivers/ exists: $(ls -d drivers/ 2>/dev/null || echo NO)"
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
 
       - name: Clone and apply SUSFS patches
