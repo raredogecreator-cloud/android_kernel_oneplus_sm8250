@@ -53,7 +53,7 @@ jobs:
 
       - name: Clone and apply SUSFS patches
         run: |
-          git clone --depth=1 https://github.com/simonpunk/susfs4ksu.git susfs4ksu
+          git clone --depth=1 https://x-access-token:${{ github.token }}@github.com/simonpunk/susfs4ksu.git susfs4ksu
 
           # Copy SUSFS source files into the kernel tree
           cp susfs4ksu/fs/susfs.c kernel-source/fs/
