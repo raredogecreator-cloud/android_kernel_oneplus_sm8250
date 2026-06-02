@@ -1,0 +1,225 @@
+name: Build Kernel - OnePlus 8 Pro (SukiSU Ultra + SUSFS)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - oneplus/SM8250_R_11.0
+
+env:
+  ARCH: arm64
+  SUBARCH: arm64
+  # SM8250 = Snapdragon 865 = "kona" (not "lahaina" which is SM8350)
+  KERNEL_DEFCONFIG: vendor/kona-perf_defconfig
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex git \
+            clang-14 lld-14 llvm-14 \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf \
+            libelf-dev libssl-dev lz4 python3 rsync zip zlib1g-dev
+
+      - name: Integrate SukiSU Ultra
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
+
+      - name: Clone and apply SUSFS patches
+        run: |
+          git clone --depth=1 https://github.com/simonpunk/susfs4ksu.git ../susfs4ksu
+
+          # Copy SUSFS source files into the kernel tree
+          cp ../susfs4ksu/fs/susfs.c fs/
+          cp ../susfs4ksu/include/linux/susfs.h include/linux/
+          [ -f ../susfs4ksu/fs/sus_path.c ] && cp ../susfs4ksu/fs/sus_path.c fs/ || true
+          [ -f ../susfs4ksu/include/linux/sus_path.h ] && cp ../susfs4ksu/include/linux/sus_path.h include/linux/ || true
+
+          echo "Patches available in susfs4ksu:"
+          find ../susfs4ksu/kernel_patches -name "*.patch" | sort
+
+          # Apply KSU hook patch (kprobe-based) if present
+          KSU_PATCH=$(find ../susfs4ksu/kernel_patches -maxdepth 1 -name "*.patch" | grep -iE "ksu|hook" | sort | head -1)
+          if [ -n "$KSU_PATCH" ]; then
+            echo "Applying KSU hook patch: $KSU_PATCH"
+            patch -p1 --forward --no-backup-if-mismatch < "$KSU_PATCH" \
+              || echo "WARNING: KSU patch failed or was already applied"
+          fi
+
+          # Apply SUSFS kernel integration patch - try 4.19-specific variants first
+          APPLIED=0
+          for PATCH in \
+            ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-4.19.patch \
+            ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android11-4.19.patch \
+            ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android10-4.19.patch \
+            $(find ../susfs4ksu/kernel_patches -name "*4.19*.patch" | sort | head -1) \
+            $(find ../susfs4ksu/kernel_patches -name "*non*gki*.patch" | sort | head -1); do
+            [ -z "$PATCH" ] || [ ! -f "$PATCH" ] && continue
+            echo "Trying SUSFS patch: $PATCH"
+            if patch -p1 --forward --no-backup-if-mismatch --dry-run < "$PATCH" &>/dev/null; then
+              patch -p1 --forward --no-backup-if-mismatch < "$PATCH"
+              echo "Successfully applied: $PATCH"
+              APPLIED=1
+              break
+            else
+              echo "Patch $PATCH not applicable, trying next..."
+            fi
+          done
+
+          if [ "$APPLIED" -eq 0 ]; then
+            echo "WARNING: No SUSFS kernel patch was applied. Manual integration may be required."
+          fi
+
+      - name: Enable required kernel configurations
+        run: |
+          DEFCONFIG="arch/arm64/configs/${KERNEL_DEFCONFIG}"
+
+          set_config() {
+            local cfg="$1" val="$2"
+            if grep -qE "^# ${cfg} is not set" "$DEFCONFIG"; then
+              sed -i "s/^# ${cfg} is not set/${cfg}=${val}/" "$DEFCONFIG"
+            elif grep -qE "^${cfg}=" "$DEFCONFIG"; then
+              sed -i "s/^${cfg}=.*/${cfg}=${val}/" "$DEFCONFIG"
+            else
+              echo "${cfg}=${val}" >> "$DEFCONFIG"
+            fi
+          }
+
+          # Non-GKI KernelSU/SukiSU requires KALLSYMS for symbol lookup
+          set_config CONFIG_KALLSYMS y
+          set_config CONFIG_KALLSYMS_ALL y
+
+          # kprobe-based hook method
+          set_config CONFIG_KPROBES y
+          set_config CONFIG_KPROBE_EVENTS y
+
+          echo "Relevant config entries after patching:"
+          grep -E "KALLSYMS|KPROBES|SUSFS" "$DEFCONFIG" || true
+
+      - name: Generate kernel .config
+        run: |
+          make \
+            CC=clang-14 \
+            LD=ld.lld-14 \
+            AR=llvm-ar-14 \
+            NM=llvm-nm-14 \
+            OBJCOPY=llvm-objcopy-14 \
+            OBJDUMP=llvm-objdump-14 \
+            STRIP=llvm-strip-14 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabihf- \
+            ARCH=arm64 \
+            O=out \
+            ${KERNEL_DEFCONFIG}
+
+      - name: Build kernel
+        run: |
+          export KBUILD_BUILD_USER="CI"
+          export KBUILD_BUILD_HOST="GitHub-Actions"
+
+          make -j$(nproc --all) \
+            CC=clang-14 \
+            LD=ld.lld-14 \
+            AR=llvm-ar-14 \
+            NM=llvm-nm-14 \
+            OBJCOPY=llvm-objcopy-14 \
+            OBJDUMP=llvm-objdump-14 \
+            STRIP=llvm-strip-14 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabihf- \
+            ARCH=arm64 \
+            O=out \
+            2>&1 | tee out/build.log
+
+          echo "--- Boot artifacts ---"
+          ls -lh out/arch/arm64/boot/ || echo "ERROR: No boot directory found"
+
+      - name: Package with AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+
+          # Write device-specific anykernel.sh for OnePlus 8 Pro (instantnoodlep)
+          cat > AnyKernel3/anykernel.sh << 'AKEOF'
+# AnyKernel3 AnyKernel Script
+# osm0sis @ xda-developers
+
+## AnyKernel setup
+properties() { '
+kernel.string=SukiSU Ultra + SUSFS Kernel
+do.devicecheck=1
+do.modules=0
+do.systemless=1
+do.cleanup=1
+do.cleanuponabort=0
+device.name1=instantnoodlep
+device.name2=OnePlus8Pro
+device.name3=
+device.name4=
+device.name5=
+supported.versions=11
+'; }
+
+## AnyKernel methods (important to source before functions)
+. tools/ak3-core.sh
+
+## AnyKernel install
+dump_boot
+write_boot
+AKEOF
+
+          BOOT_DIR="out/arch/arm64/boot"
+
+          # Copy kernel image - prefer combined Image.gz-dtb, then split files
+          if [ -f "${BOOT_DIR}/Image.gz-dtb" ]; then
+            cp "${BOOT_DIR}/Image.gz-dtb" AnyKernel3/
+            echo "Using Image.gz-dtb"
+          elif [ -f "${BOOT_DIR}/Image.gz" ]; then
+            cp "${BOOT_DIR}/Image.gz" AnyKernel3/
+            echo "Using Image.gz"
+          elif [ -f "${BOOT_DIR}/Image" ]; then
+            cp "${BOOT_DIR}/Image" AnyKernel3/
+            echo "Using Image"
+          else
+            echo "ERROR: No kernel image found in ${BOOT_DIR}" && exit 1
+          fi
+
+          # Copy DTBO image for A/B devices if present
+          [ -f "${BOOT_DIR}/dtbo.img" ] && cp "${BOOT_DIR}/dtbo.img" AnyKernel3/ || true
+
+          BUILD_DATE=$(date +%Y%m%d-%H%M%S)
+          ZIP_NAME="SukiSU-Ultra_SUSFS_OnePlus8Pro_${BUILD_DATE}.zip"
+
+          cd AnyKernel3
+          zip -r9 "../${ZIP_NAME}" . -x '*.git*' README.md '*placeholder'
+          cd ..
+
+          echo "ZIP_NAME=${ZIP_NAME}" >> "$GITHUB_ENV"
+          ls -lh "${ZIP_NAME}"
+
+      - name: Upload AnyKernel3 flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: SukiSU-Ultra-SUSFS-OnePlus8Pro
+          path: ${{ env.ZIP_NAME }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: out/build.log
+          if-no-files-found: ignore
