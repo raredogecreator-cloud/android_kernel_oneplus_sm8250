@@ -65,14 +65,26 @@ jobs:
           # --fuzz=3 --ignore-whitespace handles context mismatches in the
           # vendor-modified OnePlus tree vs stock 4.19.
           patch -p1 --fuzz=3 --ignore-whitespace -d kernel-source \
-            < susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || {
-            echo "::error::SUSFS main patch had failed hunks - listing .rej files:"
-            find kernel-source -name "*.rej" | while read f; do
+            < susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || true
+
+          # Manual injection for include/linux/sched.h KABI fix
+          sed -i '/randomized_struct_fields_end/i #if defined(CONFIG_KSU_SUSFS)\n\tu64 susfs_task_state;\n\tu64 susfs_last_fake_mnt_id;\n#endif' kernel-source/include/linux/sched.h
+          rm -f kernel-source/include/linux/sched.h.rej
+
+          # Manual injection for include/linux/mount.h KABI fix
+          sed -i '/void \*data;/i #if defined(CONFIG_KSU_SUSFS)\n\tu64 susfs_mnt_id_backup;\n#endif' kernel-source/include/linux/mount.h
+          rm -f kernel-source/include/linux/mount.h.rej
+
+          # Fail if any other .rej files remain
+          REMAINING=$(find kernel-source -name "*.rej")
+          if [ -n "$REMAINING" ]; then
+            echo "::error::SUSFS patch had unresolved failed hunks - listing .rej files:"
+            echo "$REMAINING" | while read f; do
               echo "=== $f ==="
               cat "$f"
             done
             exit 1
-          }
+          fi
 
           # Apply KSU enablement patch inside the KernelSU tree
           patch -p1 --fuzz=3 --ignore-whitespace -d kernel-source/KernelSU \
