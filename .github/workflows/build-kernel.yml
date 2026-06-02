@@ -60,9 +60,11 @@ jobs:
           cd $GITHUB_WORKSPACE/kernel-source
           echo "Current directory: $(pwd)"
           echo "drivers/ exists: $(ls -d drivers/ 2>/dev/null || echo NO)"
-          # susfs-dev branch ships SukiSU's own KSU-side SUSFS integration,
-          # so the separate 10_enable_susfs_for_ksu.patch is not needed.
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-dev
+          # susfs-main is the correct branch for non-GKI SUSFS support per
+          # SukiSU docs; it ships SukiSU's own KSU-side SUSFS integration, so
+          # the separate 10_enable_susfs_for_ksu.patch is not needed.
+          # (susfs-dev does not exist and silently fell back to the default.)
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-main
 
       - name: Clone and apply SUSFS patches
         run: |
@@ -132,11 +134,30 @@ jobs:
 
       - name: Pre-build toolchain fixes
         run: |
-          # GCC 10+ defaults to -fno-common, which trips the bundled DTC
-          # lexer's tentative "YYLTYPE yylloc;" definition (multiple
-          # definition error). Mark it extern.
-          sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/' \
-            kernel-source/scripts/dtc/dtc-lexer.lex.c_shipped || true
+          # 1. GCC/clang default to -fno-common, which trips the DTC lexer's
+          #    tentative "YYLTYPE yylloc;" definition (duplicate of the one in
+          #    the bison-generated parser). Mark it extern. The real source in
+          #    this tree is the flex input dtc-lexer.l (no .lex.c_shipped),
+          #    which flex compiles into dtc-lexer.lex.c at build time.
+          DTC_LEXER="kernel-source/scripts/dtc/dtc-lexer.l"
+          echo "Before:"; grep -n 'YYLTYPE yylloc;' "$DTC_LEXER" || true
+          sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/' "$DTC_LEXER"
+          echo "After:"; grep -n 'yylloc;' "$DTC_LEXER" || true
+
+          # 2. scripts/gcc-wrapper.py is Python 2 (shebang + print statements);
+          #    the runner only has Python 3, which fails to parse it during the
+          #    Kconfig/defconfig step. Convert the shebang and all print
+          #    statements to Python 3 syntax.
+          GCC_WRAPPER="kernel-source/scripts/gcc-wrapper.py"
+          echo "Python 2 print statements before conversion:"
+          grep -nE '^[[:space:]]*print ' "$GCC_WRAPPER" || true
+          # Shebang: python2 -> python3
+          sed -i '1s|env python2|env python3|' "$GCC_WRAPPER"
+          # "print X" -> "print(X)" for any indentation level
+          sed -i 's/^\([[:space:]]*\)print \(.*\)$/\1print(\2)/' "$GCC_WRAPPER"
+          echo "After conversion:"
+          grep -nE '^[[:space:]]*print\(' "$GCC_WRAPPER" || true
+          python3 -c "import ast; ast.parse(open('$GCC_WRAPPER').read()); print('gcc-wrapper.py parses cleanly under Python 3')"
 
       - name: Generate kernel .config
         working-directory: ${{ github.workspace }}/kernel-source
